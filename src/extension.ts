@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { agentShellCommand, configuredAgents, type ConfiguredAgent } from "./agentConfiguration";
+import { agentDisplayName } from "./agentPresentation";
 import { AgentStatusBar } from "./agentStatusBar";
 import { decodeDevContainerHostPath } from "./devContainer";
 import { GitBranchProvider } from "./gitBranchProvider";
@@ -94,6 +95,7 @@ class HerdrController implements vscode.Disposable {
   private navigationIntentPromise: Promise<boolean> | undefined;
   private disposed = false;
   private terminal: vscode.Terminal | undefined;
+  private terminalPaneId: string | undefined;
   private serverStartAttempted = false;
   private readonly consumedNavigationIntents = new ConsumedNavigationIntents();
   private readonly agentOutputRequests = new Map<string, Promise<AgentOutputPreview>>();
@@ -270,7 +272,7 @@ class HerdrController implements vscode.Disposable {
       return;
     }
     try {
-      await this.focusAgent(node.agent.pane_id);
+      await this.focusAgent(node.agent.pane_id, agentDisplayName(node.agent));
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not focus Herdr agent: ${errorMessage(error)}`);
     }
@@ -282,25 +284,28 @@ class HerdrController implements vscode.Disposable {
       return;
     }
     try {
-      await this.focusAgent(agent.pane_id);
+      await this.focusAgent(agent.pane_id, agentDisplayName(agent));
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not focus Herdr agent: ${errorMessage(error)}`);
     }
   }
 
   async openAgentByPane(paneId: string): Promise<void> {
-    if (!this.currentAgents().some((agent) => agent.pane_id === paneId)) {
+    const agent = this.currentAgents().find((candidate) => candidate.pane_id === paneId);
+    if (!agent) {
       return;
     }
     try {
-      await this.focusAgent(paneId);
+      await this.focusAgent(paneId, agentDisplayName(agent));
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not focus Herdr agent: ${errorMessage(error)}`);
     }
   }
 
-  private async focusAgent(paneId: string): Promise<void> {
-    await this.prepareTerminal();
+  // Attach a dedicated terminal to just this agent (no space/tab/pane chrome),
+  // then mirror the focus to the server so tree and status-bar selection stay in sync.
+  private async focusAgent(paneId: string, label: string): Promise<void> {
+    await this.prepareTerminal({ paneId, label });
     await this.retryFocus(() => this.client.focusAgent(paneId));
     await this.refresh(false);
   }
@@ -505,13 +510,13 @@ class HerdrController implements vscode.Disposable {
       this.consumedNavigationIntents.add(intent.requestId);
       await vscode.commands.executeCommand("workbench.view.extension.herdr");
       await vscode.commands.executeCommand(intent.kind === "agent" ? "herdr.agents.focus" : "herdr.spaces.focus");
-      if (intent.kind === "agent" || intent.kind === "attach") {
+      if (intent.kind === "agent") {
+        const agent = this.snapshot.agents.find((candidate) => candidate.pane_id === intent.paneId);
+        await this.prepareTerminal({ paneId: intent.paneId, label: agent ? agentDisplayName(agent) : intent.paneId });
+        await this.retryFocus(() => this.client.focusAgent(intent.paneId));
+      } else if (intent.kind === "attach") {
         await this.prepareTerminal();
-        if (intent.kind === "agent") {
-          await this.retryFocus(() => this.client.focusAgent(intent.paneId));
-        } else {
-          await this.retryFocus(() => this.client.focusWorkspace(intent.workspaceId));
-        }
+        await this.retryFocus(() => this.client.focusWorkspace(intent.workspaceId));
       } else {
         await this.retryFocus(() => this.client.focusWorkspace(intent.workspaceId));
       }
@@ -523,25 +528,29 @@ class HerdrController implements vscode.Disposable {
     }
   }
 
-  private async prepareTerminal(): Promise<vscode.Terminal> {
-    const candidate = this.terminal && !this.terminal.exitStatus
-      ? this.terminal
-      : vscode.window.terminals.find((terminal) => terminal.name === this.terminalName());
-    const existing = candidate && isTransientTerminal(candidate) ? candidate : undefined;
-    if (existing) {
-      this.terminal = existing;
-      await this.showPinnedTerminal(existing);
-      return existing;
+  // Without `attach`, opens the shared full-session Herdr view (spaces/tabs/panes).
+  // With `attach`, runs `herdr agent attach <pane>` so the terminal shows only that
+  // one agent. A single Herdr terminal is kept; switching modes replaces it.
+  private async prepareTerminal(attach?: { paneId: string; label: string }): Promise<vscode.Terminal> {
+    const desiredPaneId = attach?.paneId;
+    const live = this.terminal && !this.terminal.exitStatus ? this.terminal : undefined;
+    if (live && this.terminalPaneId === desiredPaneId && isTransientTerminal(live)) {
+      await this.showPinnedTerminal(live);
+      return live;
     }
-    if (candidate && isOwnedHerdrTerminal(candidate, this.terminalName())) {
-      candidate.dispose();
+    // A Herdr terminal left in a different mode (full view vs. another agent) is
+    // replaced so only one stays open at a time.
+    for (const terminal of vscode.window.terminals) {
+      if (this.ownsTerminal(terminal)) {
+        terminal.dispose();
+      }
     }
     const config = vscode.workspace.getConfiguration("herdr");
     const workspaceLocation = this.currentWorkspaceLocation();
     this.terminal = vscode.window.createTerminal({
-      name: this.terminalName(),
+      name: attach ? this.attachTerminalName(attach.label) : this.terminalName(),
       shellPath: config.get("executable", "herdr"),
-      shellArgs: this.client.terminalArgs(),
+      shellArgs: attach ? this.client.agentAttachArgs(attach.paneId) : this.client.terminalArgs(),
       cwd: workspaceLocation ? vscode.Uri.file(workspaceLocation.root) : undefined,
       iconPath: new vscode.ThemeIcon("terminal"),
       location: {
@@ -550,6 +559,7 @@ class HerdrController implements vscode.Disposable {
       },
       isTransient: true,
     });
+    this.terminalPaneId = desiredPaneId;
     await this.showPinnedTerminal(this.terminal);
     return this.terminal;
   }
@@ -603,7 +613,6 @@ class HerdrController implements vscode.Disposable {
             throw new Error("The current VS Code folder is not associated with a Herdr space.");
           }
           const { workspace, root } = association;
-          await this.prepareTerminal();
           await this.client.focusWorkspace(workspace.workspace_id);
           const created = await this.client.createTab(workspace.workspace_id, root, agent.name);
           try {
@@ -616,11 +625,39 @@ class HerdrController implements vscode.Disposable {
             }
             throw error;
           }
-          await this.refresh(false);
+          // Attach to just the new agent once Herdr detects it in the pane;
+          // fall back to the full session view for commands it can't detect.
+          if (await this.waitForAgentPane(created.root_pane.pane_id, 5_000)) {
+            await this.focusAgent(created.root_pane.pane_id, agent.name);
+          } else {
+            await this.prepareTerminal();
+            await this.retryFocus(() => this.client.focusWorkspace(workspace.workspace_id));
+            await this.refresh(false);
+          }
         },
       );
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not start Herdr agent: ${errorMessage(error)}`);
+    }
+  }
+
+  // Poll the socket until the pane shows up as a detected agent, since Herdr's
+  // `agent attach` rejects panes it has not yet recognized as an agent.
+  private async waitForAgentPane(paneId: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        const snapshot = await this.client.snapshot();
+        if (snapshot.agents.some((agent) => agent.pane_id === paneId)) {
+          return true;
+        }
+      } catch {
+        // The server can be briefly unavailable; keep polling until the deadline.
+      }
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await delay(150);
     }
   }
 
@@ -847,6 +884,18 @@ class HerdrController implements vscode.Disposable {
     const session = vscode.workspace.getConfiguration("herdr").get<string>("session", "").trim();
     return session ? `${TERMINAL_NAME} (${session})` : TERMINAL_NAME;
   }
+
+  private attachTerminalName(label: string): string {
+    return `${this.terminalName()}: ${label}`;
+  }
+
+  private ownsTerminal(terminal: vscode.Terminal): boolean {
+    const base = this.terminalName();
+    const owned = terminal.name === base || terminal.name.startsWith(`${base}: `);
+    return owned
+      && "shellPath" in terminal.creationOptions
+      && terminal.creationOptions.shellPath !== undefined;
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -900,10 +949,4 @@ async function waitForTerminalProcess(terminal: vscode.Terminal): Promise<void> 
 
 function isTransientTerminal(terminal: vscode.Terminal): boolean {
   return "isTransient" in terminal.creationOptions && terminal.creationOptions.isTransient === true;
-}
-
-function isOwnedHerdrTerminal(terminal: vscode.Terminal, expectedName: string): boolean {
-  return terminal.name === expectedName
-    && "shellPath" in terminal.creationOptions
-    && terminal.creationOptions.shellPath !== undefined;
 }
