@@ -98,6 +98,7 @@ class HerdrController implements vscode.Disposable {
   private disposed = false;
   private readonly terminals = new Map<string, vscode.Terminal>();
   private agentStatuses = new Map<string, AgentStatus>();
+  private attachConfigPath: string | undefined;
   private serverStartAttempted = false;
   private readonly consumedNavigationIntents = new ConsumedNavigationIntents();
   private readonly agentOutputRequests = new Map<string, Promise<AgentOutputPreview>>();
@@ -114,10 +115,28 @@ class HerdrController implements vscode.Disposable {
   ) {}
 
   async start(): Promise<void> {
+    await this.ensureAttachConfig();
     await this.refresh(false);
     await this.reconcileFolders();
     await this.handleWindowActivated();
     this.schedule();
+  }
+
+  // Writes a minimal Herdr config that turns off mouse capture, used only by the
+  // attach panels via HERDR_CONFIG_PATH. Herdr derives its socket from the config
+  // directory, not this file, so the attach client still reaches the running
+  // server while the full TUI keeps the user's own config and mouse UI.
+  private async ensureAttachConfig(): Promise<void> {
+    try {
+      const dir = this.context.globalStorageUri;
+      await vscode.workspace.fs.createDirectory(dir);
+      const file = vscode.Uri.joinPath(dir, "attach-config.toml");
+      await vscode.workspace.fs.writeFile(file, Buffer.from("[ui]\nmouse_capture = false\n", "utf8"));
+      this.attachConfigPath = file.fsPath;
+    } catch (error) {
+      this.output.warn(`Could not write the Herdr attach config: ${errorMessage(error)}`);
+      this.attachConfigPath = undefined;
+    }
   }
 
   activeAgent() {
@@ -576,11 +595,15 @@ class HerdrController implements vscode.Disposable {
     }
     const config = vscode.workspace.getConfiguration("herdr");
     const workspaceLocation = this.currentWorkspaceLocation();
+    const attachEnv = attach && this.attachConfigPath && config.get("disableMouseCaptureOnAttach", true)
+      ? { HERDR_CONFIG_PATH: this.attachConfigPath }
+      : undefined;
     const terminal = vscode.window.createTerminal({
       name: attach ? attach.label : this.terminalName(),
       shellPath: config.get("executable", "herdr"),
       shellArgs: attach ? this.client.agentAttachArgs(attach.paneId) : this.client.terminalArgs(),
       cwd: workspaceLocation ? vscode.Uri.file(workspaceLocation.root) : undefined,
+      env: attachEnv,
       iconPath: new vscode.ThemeIcon("terminal"),
       location: {
         viewColumn: vscode.ViewColumn.Active,

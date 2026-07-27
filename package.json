@@ -151,6 +151,12 @@
           "scope": "application",
           "default": true,
           "description": "Show a notification when an agent in this window's space needs input or finishes."
+        },
+        "herdr.disableMouseCaptureOnAttach": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "description": "Turn off Herdr's mouse capture in the agent panels opened by this extension so you can select and copy text natively. Only affects these attached panels, not the full Herdr TUI."
         }
       }
     },

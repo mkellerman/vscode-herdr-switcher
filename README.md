@@ -43,6 +43,7 @@ Herdr remains the source of truth. Cross-window actions are delivered through sh
 - `herdr.agents`: agents available from the Add Agent picker
 - `herdr.defaultAgent`: agent launched by the `+` button
 - `herdr.notifyAgentStatus`: notify when an agent needs input or finishes
+- `herdr.disableMouseCaptureOnAttach`: let you select and copy text in agent panels
 
 All settings are user-level settings. The default agents are Claude Code and Codex:
 
