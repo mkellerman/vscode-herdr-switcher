@@ -24,7 +24,7 @@ import {
   type AgentNode,
   type SpaceNode,
 } from "./treeProvider";
-import type { HerdrSnapshot } from "./types";
+import type { HerdrAgent, HerdrSnapshot, HerdrTab } from "./types";
 
 const BINDINGS_KEY = "herdr.spaceBindings.v1";
 const TERMINAL_NAME = "Herdr";
@@ -94,8 +94,7 @@ class HerdrController implements vscode.Disposable {
   private refreshPromise: Promise<void> | undefined;
   private navigationIntentPromise: Promise<boolean> | undefined;
   private disposed = false;
-  private terminal: vscode.Terminal | undefined;
-  private terminalPaneId: string | undefined;
+  private readonly terminals = new Map<string, vscode.Terminal>();
   private serverStartAttempted = false;
   private readonly consumedNavigationIntents = new ConsumedNavigationIntents();
   private readonly agentOutputRequests = new Map<string, Promise<AgentOutputPreview>>();
@@ -272,7 +271,7 @@ class HerdrController implements vscode.Disposable {
       return;
     }
     try {
-      await this.focusAgent(node.agent.pane_id, agentDisplayName(node.agent));
+      await this.focusAgent(node.agent.pane_id, this.agentTerminalName(node.agent));
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not focus Herdr agent: ${errorMessage(error)}`);
     }
@@ -284,7 +283,7 @@ class HerdrController implements vscode.Disposable {
       return;
     }
     try {
-      await this.focusAgent(agent.pane_id, agentDisplayName(agent));
+      await this.focusAgent(agent.pane_id, this.agentTerminalName(agent));
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not focus Herdr agent: ${errorMessage(error)}`);
     }
@@ -296,7 +295,7 @@ class HerdrController implements vscode.Disposable {
       return;
     }
     try {
-      await this.focusAgent(paneId, agentDisplayName(agent));
+      await this.focusAgent(paneId, this.agentTerminalName(agent));
     } catch (error) {
       void vscode.window.showErrorMessage(`Could not focus Herdr agent: ${errorMessage(error)}`);
     }
@@ -512,7 +511,7 @@ class HerdrController implements vscode.Disposable {
       await vscode.commands.executeCommand(intent.kind === "agent" ? "herdr.agents.focus" : "herdr.spaces.focus");
       if (intent.kind === "agent") {
         const agent = this.snapshot.agents.find((candidate) => candidate.pane_id === intent.paneId);
-        await this.prepareTerminal({ paneId: intent.paneId, label: agent ? agentDisplayName(agent) : intent.paneId });
+        await this.prepareTerminal({ paneId: intent.paneId, label: agent ? this.agentTerminalName(agent) : intent.paneId });
         await this.retryFocus(() => this.client.focusAgent(intent.paneId));
       } else if (intent.kind === "attach") {
         await this.prepareTerminal();
@@ -530,25 +529,26 @@ class HerdrController implements vscode.Disposable {
 
   // Without `attach`, opens the shared full-session Herdr view (spaces/tabs/panes).
   // With `attach`, runs `herdr agent attach <pane>` so the terminal shows only that
-  // one agent. A single Herdr terminal is kept; switching modes replaces it.
+  // one agent. Each attached agent keeps its own terminal (keyed by pane), so
+  // opening a second agent from the same workspace adds a panel instead of
+  // replacing the first; the full-session view shares a single terminal.
   private async prepareTerminal(attach?: { paneId: string; label: string }): Promise<vscode.Terminal> {
-    const desiredPaneId = attach?.paneId;
-    const live = this.terminal && !this.terminal.exitStatus ? this.terminal : undefined;
-    if (live && this.terminalPaneId === desiredPaneId && isTransientTerminal(live)) {
-      await this.showPinnedTerminal(live);
-      return live;
+    const key = attach?.paneId ?? "";
+    const existing = this.terminals.get(key);
+    const alive = existing && !existing.exitStatus && vscode.window.terminals.includes(existing)
+      ? existing
+      : undefined;
+    if (alive && isTransientTerminal(alive)) {
+      await this.showPinnedTerminal(alive);
+      return alive;
     }
-    // A Herdr terminal left in a different mode (full view vs. another agent) is
-    // replaced so only one stays open at a time.
-    for (const terminal of vscode.window.terminals) {
-      if (this.ownsTerminal(terminal)) {
-        terminal.dispose();
-      }
+    if (existing) {
+      this.terminals.delete(key);
     }
     const config = vscode.workspace.getConfiguration("herdr");
     const workspaceLocation = this.currentWorkspaceLocation();
-    this.terminal = vscode.window.createTerminal({
-      name: attach ? this.attachTerminalName(attach.label) : this.terminalName(),
+    const terminal = vscode.window.createTerminal({
+      name: attach ? attach.label : this.terminalName(),
       shellPath: config.get("executable", "herdr"),
       shellArgs: attach ? this.client.agentAttachArgs(attach.paneId) : this.client.terminalArgs(),
       cwd: workspaceLocation ? vscode.Uri.file(workspaceLocation.root) : undefined,
@@ -559,9 +559,9 @@ class HerdrController implements vscode.Disposable {
       },
       isTransient: true,
     });
-    this.terminalPaneId = desiredPaneId;
-    await this.showPinnedTerminal(this.terminal);
-    return this.terminal;
+    this.terminals.set(key, terminal);
+    await this.showPinnedTerminal(terminal);
+    return terminal;
   }
 
   private async showPinnedTerminal(terminal: vscode.Terminal): Promise<void> {
@@ -628,7 +628,7 @@ class HerdrController implements vscode.Disposable {
           // Attach to just the new agent once Herdr detects it in the pane;
           // fall back to the full session view for commands it can't detect.
           if (await this.waitForAgentPane(created.root_pane.pane_id, 5_000)) {
-            await this.focusAgent(created.root_pane.pane_id, agent.name);
+            await this.focusAgent(created.root_pane.pane_id, terminalNameFor(agent.name, created.tab));
           } else {
             await this.prepareTerminal();
             await this.retryFocus(() => this.client.focusWorkspace(workspace.workspace_id));
@@ -885,17 +885,20 @@ class HerdrController implements vscode.Disposable {
     return session ? `${TERMINAL_NAME} (${session})` : TERMINAL_NAME;
   }
 
-  private attachTerminalName(label: string): string {
-    return `${this.terminalName()}: ${label}`;
+  // Names the agent's terminal panel "<agent>: <tab>" so agents from the same
+  // workspace stay distinguishable. Falls back to the tab number when the tab
+  // label is missing or just repeats the agent name.
+  private agentTerminalName(agent: HerdrAgent): string {
+    return terminalNameFor(agentDisplayName(agent), this.snapshot?.tabs.find((tab) => tab.tab_id === agent.tab_id));
   }
+}
 
-  private ownsTerminal(terminal: vscode.Terminal): boolean {
-    const base = this.terminalName();
-    const owned = terminal.name === base || terminal.name.startsWith(`${base}: `);
-    return owned
-      && "shellPath" in terminal.creationOptions
-      && terminal.creationOptions.shellPath !== undefined;
+function terminalNameFor(displayName: string, tab: HerdrTab | undefined): string {
+  if (!tab) {
+    return displayName;
   }
+  const tabLabel = tab.label && tab.label !== displayName ? tab.label : String(tab.number);
+  return `${displayName}: ${tabLabel}`;
 }
 
 function errorMessage(error: unknown): string {
