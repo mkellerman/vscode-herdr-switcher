@@ -145,6 +145,12 @@
           "scope": "application",
           "default": "Claude Code",
           "description": "Agent name from herdr.agents launched by the + button."
+        },
+        "herdr.notifyAgentStatus": {
+          "type": "boolean",
+          "scope": "application",
+          "default": true,
+          "description": "Show a notification when an agent in this window's space needs input or finishes."
         }
       }
     },

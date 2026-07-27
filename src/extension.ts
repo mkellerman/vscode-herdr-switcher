@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { agentShellCommand, configuredAgents, type ConfiguredAgent } from "./agentConfiguration";
+import { detectAgentPings } from "./agentPing";
 import { agentDisplayName } from "./agentPresentation";
 import { AgentStatusBar } from "./agentStatusBar";
 import { decodeDevContainerHostPath } from "./devContainer";
@@ -24,7 +25,7 @@ import {
   type AgentNode,
   type SpaceNode,
 } from "./treeProvider";
-import type { HerdrAgent, HerdrSnapshot, HerdrTab } from "./types";
+import type { AgentStatus, HerdrAgent, HerdrSnapshot, HerdrTab } from "./types";
 
 const BINDINGS_KEY = "herdr.spaceBindings.v1";
 const TERMINAL_NAME = "Herdr";
@@ -56,6 +57,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     status,
     store.onDidChange(() => { void syncSelection(); }),
     store.onDidChange(updateStatus),
+    store.onDidChange(() => controller.notifyChangedAgents()),
     spacesView.onDidChangeVisibility(() => { void syncSelection(); }),
     agentsView.onDidChangeVisibility(() => { void syncSelection(); }),
     vscode.commands.registerCommand("herdr.refresh", () => controller.refresh(true)),
@@ -95,6 +97,7 @@ class HerdrController implements vscode.Disposable {
   private navigationIntentPromise: Promise<boolean> | undefined;
   private disposed = false;
   private readonly terminals = new Map<string, vscode.Terminal>();
+  private agentStatuses = new Map<string, AgentStatus>();
   private serverStartAttempted = false;
   private readonly consumedNavigationIntents = new ConsumedNavigationIntents();
   private readonly agentOutputRequests = new Map<string, Promise<AgentOutputPreview>>();
@@ -129,6 +132,32 @@ class HerdrController implements vscode.Disposable {
     return association && this.snapshot
       ? agentsForWorkspace(this.snapshot, association.workspace.workspace_id)
       : [];
+  }
+
+  // Pings when an agent in this window's space starts waiting on input or
+  // finishes, mirroring Herdr's own terminal notifications. Statuses are tracked
+  // even while notifications are disabled so toggling the setting on does not
+  // replay past transitions.
+  notifyChangedAgents(): void {
+    if (!this.snapshot) {
+      return;
+    }
+    const { pings, statuses } = detectAgentPings(this.agentStatuses, this.currentAgents(), agentDisplayName);
+    this.agentStatuses = statuses;
+    if (!vscode.workspace.getConfiguration("herdr").get("notifyAgentStatus", true)) {
+      return;
+    }
+    for (const ping of pings) {
+      const message = ping.status === "blocked" ? `${ping.name} needs your input.` : `${ping.name} finished.`;
+      const show = ping.status === "blocked"
+        ? vscode.window.showWarningMessage.bind(vscode.window)
+        : vscode.window.showInformationMessage.bind(vscode.window);
+      void show(message, "Open").then((choice) => {
+        if (choice === "Open") {
+          void this.openAgentByPane(ping.paneId);
+        }
+      });
+    }
   }
 
   agentOutputPreview(paneId: string): Promise<AgentOutputPreview> {
