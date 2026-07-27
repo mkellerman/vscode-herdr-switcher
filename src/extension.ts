@@ -784,6 +784,15 @@ class HerdrController implements vscode.Disposable {
     if (!vscode.env.remoteName) {
       return { root: folder.uri.fsPath, workspaceUri: folder.uri };
     }
+    if (
+      this.context.extension.extensionKind === vscode.ExtensionKind.Workspace
+      && folder.uri.scheme === "file"
+    ) {
+      // Running on the remote extension host (e.g. Remote SSH): folders,
+      // terminals, and the herdr binary all live on the same machine, so the
+      // local code path applies unchanged.
+      return { root: folder.uri.fsPath, workspaceUri: folder.uri };
+    }
     if (vscode.env.remoteName !== "dev-container" || folder.uri.scheme !== "vscode-remote") {
       return undefined;
     }
