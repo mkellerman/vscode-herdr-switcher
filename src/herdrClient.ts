@@ -108,7 +108,10 @@ export class HerdrClient {
   }
 
   agentAttachArgs(target: string): string[] {
-    return [...this.terminalArgs(), "agent", "attach", target];
+    // --takeover: only one writable client owns a directly-attached terminal;
+    // clicking an agent in VS Code should claim input even if another client
+    // (an older panel, a plain-terminal attach) still holds it.
+    return [...this.terminalArgs(), "agent", "attach", target, "--takeover"];
   }
 
   startServer(): Promise<void> {
